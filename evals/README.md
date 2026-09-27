@@ -33,6 +33,7 @@ python evals/run_eval.py --mode retrieval
 # 3) 端到端：跑完整 Agent，看工具编排和事实准确性（要花钱，先用 --limit 3 试水）
 python evals/run_eval.py --mode agent --limit 3
 python evals/run_eval.py --mode agent
+python evals/run_eval.py --mode agent --only mh-015    # 只重跑某一条：改完判分/工具后验证用，最省钱
 
 # 4) 可选：再叠一层大模型评委，专抓规则判分抓不到的幻觉
 python evals/run_eval.py --mode agent --judge
@@ -308,9 +309,187 @@ python evals/namecheck.py .            # 扫整个工程（自动跳过 .venv / 
 
 ---
 
+### 实验 4：判分误伤，比漏判更值得修
+
+全量端到端首跑：
+
+```
+工具选择=86.7%  参数正确=100.0%  事实命中=80.0%  通过率=73.3%
+```
+
+参数正确率 100% 说明 `month` 那个修复生效了（模型第一次漏传，工具把「Field required」回传，模型自己补上）。
+但 80% 的事实命中里，有两条失败长这样：
+
+```
+- 缺失事实：滤网接近寿命上限
+- 回答节选：...耗材状态：滤网已接近寿命上限，建议本月及时更换...
+```
+
+金标要的是 `data/external/records.csv` 里的原文「滤网接近寿命上限」，模型写的是「滤网**已**接近寿命上限」——
+多插了一个字，`must_include` 的子串判定就判它没命中。**这是判分器误伤，不是模型答错。**
+
+修法：把「允许改写」的事实从严格子串换成正则，并且**给判据本身写负控**。
+
+| 判据 | 放什么 | 例子 |
+| --- | --- | --- |
+| `must_include` | 数字、专名这类**改一个字就是错**的 | `47`、`62.7`、`复式` |
+| `must_match` | 允许插语气词的整句事实（正则） | `滤网[^。；\n]{0,6}接近[^。；\n]{0,6}上限` |
+| `must_not_include` | 不许出现的**错误结论**（负控） | `滤网状态良好`、`滤网未接近` |
+
+这三条判据本身就是实验对象，一共改了两版：
+
+| 版本 | 判据 | 事实命中 | 通过率 |
+| --- | --- | --- | --- |
+| 首跑 | `must_include` 严格子串 | 80.0% (12/15) | 73.3% (11/15) |
+| v1 | 正则只在「滤网 → 接近」之间放宽：`滤网.{0,3}接近寿命上限` | 93.3% (14/15) | 93.3% (14/15) |
+| v2 | 容错放到两侧 + 补负控（定稿版） | **100%** (15/15) | **100%** (15/15) |
+
+v1 之后只剩 mh-003 还挂着，模型这次写的是：
+
+```
+- **滤网**：已接近使用寿命上限，**建议本月内更换**
+```
+
+v1 把容错留在「滤网 → 接近」之间，而这次**插字插在「接近 → 寿命」之间**（多了「使用」）。
+放宽的位置放错了地方，等于没放宽。v2 在两侧各给 6 个字容错，5 种真实改写写法全部命中。
+
+第二个坑是 `.` 配 `re.S`：`.` 会跨行匹配，
+一段正常报告里「滤网…（换行）…接近寿命上限」可能被**跨行拼出一次误命中**。
+v2 用 `[^。；\n]` 代替 `.`，把「同一句、同一行」写进判据 —— 容错范围本身就是一条规格。
+
+第三件事：正则分不清否定。「滤网未接近寿命上限，无需更换」用 v2 的正则照样能匹配上，
+所以补 `must_not_include` 负控（判分器本来就支持，只是评测集里一直没人用）。
+负控同样做了双向验证：6 条「该挂」的写法（状态良好 / 已更换 / 未接近 / 接近了更换周期）全部判失败，
+5 条「该过」的改写全部判通过。
+
+> 放宽判据必须配负控，否则你只是在把分数调好看。判分器放宽的是**改写容忍度**，不是结论的正确性。
+
+> 定稿效果：拿同一批真实回答离线复算（`score_case` 是纯函数，复算等价于重跑判分），
+> 15/15 全过；同一批回答用旧判据是 14/15。
+
+---
+
+### 实验 5：评测脚本自己把用例打断了
+
+mh-015（报告 + 知识库联合场景）只跑了 2.05s 就结束，明细里只有一行：
+
+```
+| mh-015 | 报错 | (未调用工具) | 50.0 | - | 2.05s |
+- 报错：KeyError: 'name'
+```
+
+问题不在模型，在**链路**：这条用例只调了一次模型就抛异常，工具一次都没跑到。
+而报告只说 `KeyError: 'name'`，不说是哪一行 —— 这种报错等于没报。两处修：
+
+| 改哪 | 改成什么 | 为什么 |
+| --- | --- | --- |
+| `evals/run_eval.py` | 异常时把 `traceback.format_exc()` 存进 JSONL，控制台和报告只打最后 3 个调用帧 | 定位靠栈，不靠猜 |
+| `agent/tools/middleware.py` | `monitor_tool` 不再直接取 `request.tool_call["name"]`，缺 name 时记 error 日志并回一条错误 ToolMessage | 模型偶尔会吐出没有 name 的工具调用；一个畸形调用不该打断整轮对话 |
+
+再加一个 `--only`，重放一条用例就不用再烧全量的钱：
+
+```bash
+python evals/run_eval.py --mode agent --only mh-015
+```
+
+重放之后再确认一次：如果控制台还在报同一个 `KeyError`，明细 JSONL 里的 `error_traceback`
+会直接指出是哪一层 —— 定位到框架内部就照着那一帧继续修，不用再猜。
+
+两个修的实测效果：
+
+| 用例 | 修之前 | 修之后 |
+| --- | --- | --- |
+| mh-015（`--only mh-015` 单条重放） | 2.05s 就结束、一次工具没调、报 `KeyError: 'name'` | **通过**：18.1s，6 次工具调用（fill_context_report → get_user_id → get_current_month → fetch_external_data ×2 → rag_summarize）全部成功 |
+| 全量 15 条 | 执行报错 1 条 | 执行报错 **0** 条 |
+
+当时的推断：`logs/agent_260927.log` 里 mh-015 最后一轮停在「即将调用模型」之后、
+「[工具监控]开始调用工具」之前，所以怀疑问题出在 `monitor_tool` 里那处 `tool_call["name"]` 取值。
+
+> **这条推断后来被 traceback 证伪了 —— 见实验 6。** 真正崩的不是 `monitor_tool`，而是更下面一层：
+> 上游适配器解析流式响应时硬取 `prev_function["name"]`。`monitor_tool` 那处防御**保留**，
+> 它管的是「工具调用序列被截断」这种情况，是第二道防线；模型响应解析阶段的异常它抓不到。
+
+---
+
+### 实验 6：同一份代码，跑分从 100% 掉到 50%
+
+上面的 100% 是 17:13 那次全量（`results/agent-20260927-171344.md`）。**代码一个字没改**，
+17:23 又跑一次全量：工具选择 50.0%、参数正确 100.0%、事实命中 50.0%、通过率 50.0%
+（`results/agent-20260927-172320.md`）。
+
+同一份代码、同一批用例、同一个模型，两次差这么多 —— 这不是「模型变差了」，是**概率性故障**。
+看挂掉的那几条，明细里不是判分失败，而是**整条用例直接报错**：
+
+```
+| mh-003 | 报错 | (未调用工具) | 1.74s |
+- 报错：KeyError: 'name'
+```
+
+1.74s、工具一次没调 —— 和实验 5 的 mh-015 是同一个签名。区别在于这次 JSONL 里存了
+**完整 traceback**（就是实验 5 加的那条改动），一眼就能读出崩在哪一层：
+
+```
+langchain_core/language_models/chat_models.py:1981  _generate_with_cache
+    for chunk in self._stream(messages, stop=stop, **kwargs):
+langchain_community/chat_models/tongyi.py:733  _stream
+    for stream_resp, is_last_chunk in generate_with_last_element_mark(
+langchain_community/chat_models/tongyi.py:578  _stream_completion_with_retry
+    delta_resp = self.subtract_client_response(resp, prev_resp)
+langchain_community/chat_models/tongyi.py:611  subtract_client_response
+    prev_function["name"], ""
+KeyError: 'name'
+```
+
+> **实验 5 的推断在这里被证伪。** 崩点根本不在 `monitor_tool`，而在 `subtract_client_response`：
+> 上游适配器把流式增量块拼成完整响应时，假定每个块都带 `name` 字段；qwen3-max 偶发吐出不带
+> `name` 的工具调用增量，硬取字典键就崩了。这发生在**工具中间件之前**，所以 `monitor_tool` 里
+> 再多的防御也拦不住。
+
+三条结论直接决定了修法：
+
+| 结论 | 影响 |
+| --- | --- |
+| `_stream` 被 `_generate` 和 `_generate_with_cache` 共用 | 改成 `streaming=False` **逃不掉**这条路径，别指望关流式绕开 |
+| 崩在「模型响应解析」阶段，早于工具中间件 | `monitor_tool` 抓不到，兜底必须做在**模型调用级** |
+| `max_retries=3` 只在 HTTP 层生效 | 救不了这类解析异常，得自己在中间件层重试 |
+
+修法：新增第 5 个中间件 `retry_model_call`（`@wrap_model_call`），挂在中间件列表**最后一位**
+—— 列表越靠后越贴近模型调用，异常就在这一层被接住并重试一次：
+
+```python
+@wrap_model_call
+def retry_model_call(request: ModelRequest, handler: Callable) -> Any:
+    try:
+        return handler(request)
+    except KeyError as error:
+        logger.warning(f"[模型调用]响应解析失败（{type(error).__name__}: {error}），重试一次")
+        return handler(request)
+```
+
+同时 `run_eval.py` 加了**可见重试**：`call_agent(agent, question, attempts=2)` 返回
+`(result, retries)`，`retries` 写进明细 JSONL，报告里新增「一次通过 / 发生重试」一栏 ——
+重试不藏起来，藏起来就把不稳定性掩盖了。
+
+> 说清楚边界：这是**兜底**，不是**根治**。根治要么给 `langchain_community` 打本地补丁改
+> `subtract_client_response`（跟上游升级打架），要么换一个不这样解析的适配器。对业务项目来说，
+> 在离模型最近的一层做一次重试，性价比最高，也最诚实。
+
+效果：
+
+| 项 | 加 `retry_model_call` 之前 | 之后 |
+| --- | --- | --- |
+| mh-003（`--only mh-003` 单条重放） | 1.74s、0 次工具、报 `KeyError: 'name'` | 多跳链路跑完、**通过** |
+| 端到端全量 15 条 | 概率性掉到 50.0% | 稳定满分（偶发重试会在报告里显示次数） |
+
+这条经验面试可以直接讲：**「我的评测集抓出了一个概率性、只在模型响应里偶发的适配器缺陷 ——
+它平时躲在 100% 后面，你只有一个 demo 的时候永远看不见它。」**
+
+---
+
 ## 六、把结果写进主 README
 
-跑完 `--mode retrieval` 和 `--mode agent` 之后，把 `results/latest.md` 里的数字填进主 README：
+跑完 `--mode retrieval` 和 `--mode agent` 之后，把 `results/latest.md` 里的数字填进主 README。
+下面这份是本次实测值（主仓库 `README.md` 第九节与之一致）：
 
 ```markdown
 ## 九、评测结果
@@ -320,17 +499,17 @@ python evals/namecheck.py .            # 扫整个工程（自动跳过 .venv / 
 
 | 指标 | 数值 |
 | --- | --- |
-| 检索 Recall@3 | __% |
-| 检索 Hit@1 | __% |
-| 检索 MRR | ___ |
-| 工具选择准确率 | __% |
-| 工具参数正确率 | __% |
-| 关键事实命中率 | __% |
-| 端到端通过率 | __% |
+| 检索 Recall@3 | 100.0% |
+| 检索 Hit@1 | 94.0% |
+| 检索 MRR | 0.970 |
+| 工具选择准确率 | 100.0% |
+| 工具参数正确率 | 100.0% |
+| 关键事实命中率 | 100.0% |
+| 端到端通过率 | 100.0% |
 
-调参记录：chunk_size 200 → 400 后 Recall@3 从 90.0% 提升到 __%。
+调参记录：chunk_size 200 → 400 后 Recall@3 从 90.0% 提升到 100.0%。
 
-复现：```python evals/build_golden.py --with-manuals && python evals/run_eval.py --mode retrieval```
+复现：`python evals/build_golden.py --with-manuals && python evals/run_eval.py --mode retrieval`
 ```
 
 面试时这句话的分量：**「我没有只做一个 demo，我给它配了评测集，知道它现在几分、哪几条挂了、为什么挂、改哪个参数能好。」**
@@ -350,3 +529,5 @@ python evals/namecheck.py .            # 扫整个工程（自动跳过 .venv / 
 | `agent` 模式很慢/很贵 | 每条用例是一整轮多跳对话。先 `--limit 3` 验证链路，再全量 |
 | 报告里中文变问号 | 只影响控制台显示，`results/*.md` 里始终是正确的 UTF-8 |
 | 跑分中途 `NameError: name 'xxx' is not defined` | 改脚本时删了变量定义、忘了删引用。跑 `python evals/namecheck.py evals`，1 秒给出文件和行号 |
+| 报告只写「报错：KeyError: 'xxx'」看不出在哪 | 明细 JSONL 里现在带完整 traceback；再用 `--only <id>` 单条重放，不用跑全量 |
+| `agent` 模式整条用例报 `KeyError: 'name'`（0 次工具、1~2s 就结束） | 上游适配器拼接流式工具调用时缺 `name`。已加 `retry_model_call` 中间件兜底重试，报告里会显示重试次数 |

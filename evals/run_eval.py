@@ -4,6 +4,7 @@
 
     python evals/run_eval.py --mode retrieval            # 只跑向量检索：Recall@k / MRR
     python evals/run_eval.py --mode agent --limit 5      # 端到端 Agent：工具编排 + 事实命中
+    python evals/run_eval.py --mode agent --only mh-015  # 只重跑某一条：改完判分/工具后验证，最省钱
     python evals/run_eval.py --mode judge --run evals/results/agent-xxx.jsonl
 
 三条设计原则（面试可以展开讲）：
@@ -26,6 +27,7 @@ import pathlib
 import re
 import sys
 import time
+import traceback
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -202,9 +204,59 @@ def score_case(
 
 
 # --------------------------------------------------------------------------- #
+# 用例筛选与报错定位（两个模式共用）
+# --------------------------------------------------------------------------- #
+def select_cases(cases: list[dict], only: str, limit: int) -> list[dict]:
+    """挑用例：--only 按 id 精确挑（调试单条用），否则 --limit 取前 N 条。"""
+    wanted = {item.strip() for item in (only or "").split(",") if item.strip()}
+    if not wanted:
+        return cases[:limit] if limit else cases
+    selected = [case for case in cases if case.get("id") in wanted]
+    if not selected:
+        raise SystemExit(f"--only {only} 没有匹配到任何用例")
+    missing = sorted(wanted - {case.get("id") for case in selected})
+    if missing:
+        print(f"[提示] --only 里这些 id 在评测集里不存在：{', '.join(missing)}")
+    return selected
+
+
+def short_traceback(text: str, keep: int = 3) -> str:
+    """把完整 traceback 压成最后 keep 个调用帧：控制台和报告里一眼能看到出错位置。"""
+    frames = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip().startswith("File ")
+    ]
+    return " <- ".join(frames[-keep:]) if frames else "(无调用帧)"
+
+
+def call_agent(agent, question: str, attempts: int = 2) -> tuple[dict, int]:
+    """调用 Agent 并做「可见重试」。
+
+    上游适配器（`langchain_community` 的 tongyi）拼接流式工具调用增量时偶发缺 `name` 字段，
+    硬取字典键会抛 `KeyError`，整轮对话被直接打断 —— 重试一次通常就好了。
+    返回值带上重试次数（0 = 一次过），会写进明细 JSONL 和报告：**不静默重试**。
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = agent.agent.invoke(
+                {"messages": [{"role": "user", "content": question}]},
+                context=agent._new_context(),
+            )
+            return result, attempt - 1
+        except Exception as exc:  # noqa: BLE001 - 评测脚本要记录失败，而不是中断
+            last_error = exc
+            print(f"        调用失败 {attempt}/{attempts}：{type(exc).__name__}: {str(exc)[:80]}")
+    raise last_error  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
 # 模式一：检索指标
 # --------------------------------------------------------------------------- #
-def run_retrieval(cases: list[dict], k: int, limit: int, threshold: float) -> list[dict]:
+def run_retrieval(
+    cases: list[dict], k: int, limit: int, threshold: float, only: str = ""
+) -> list[dict]:
     use_project_modules()
     from rag.vector_store import VectorStoreService
 
@@ -213,7 +265,7 @@ def run_retrieval(cases: list[dict], k: int, limit: int, threshold: float) -> li
     if vector_count <= 0:
         raise SystemExit("向量库是空的。\n修复：先构建知识库 -> python main.py --build-kb")
 
-    selected = cases[:limit] if limit else cases
+    selected = select_cases(cases, only, limit)
     print(f"[检索评测] 向量库 {vector_count} 个片段 | TopK={k} | 用例 {len(selected)} 条")
 
     retriever = service.get_retriever(k=k)
@@ -355,6 +407,7 @@ def run_agent(
     freeze_user: str,
     freeze_city: str,
     freeze_date: str,
+    only: str = "",
 ) -> list[dict]:
     use_project_modules()
     require_api_key()
@@ -363,7 +416,7 @@ def run_agent(
     from agent.react_agent import ReactAgent
 
     agent = ReactAgent()
-    selected = cases[:limit] if limit else cases
+    selected = select_cases(cases, only, limit)
     print(
         f"[端到端评测] 用例 {len(selected)} 条 | 冻结 用户={freeze_user} "
         f"城市={freeze_city} 月份={freeze_date or '真实时间'}"
@@ -373,17 +426,18 @@ def run_agent(
     for index, case in enumerate(selected, start=1):
         started = time.perf_counter()
         answer, error, tool_calls, tool_outputs = "", "", [], []
+        error_traceback = ""
+        retries = 0
         try:
             # 走底层图调用而不是 execute()，是为了拿到完整的消息历史（工具链路）
-            result = agent.agent.invoke(
-                {"messages": [{"role": "user", "content": case["question"]}]},
-                context=agent._new_context(),
-            )
+            result, retries = call_agent(agent, case["question"], attempts=2)
             answer = ReactAgent._final_content(result["messages"])
             tool_calls = extract_tool_calls(result["messages"])
             tool_outputs = extract_tool_outputs(result["messages"])
         except Exception as exc:  # noqa: BLE001 - 评测脚本要把失败也记下来而不是中断
             error = f"{type(exc).__name__}: {exc}"
+            # 只留一行报错信息是没法定位的：完整栈进 JSONL，控制台只打最后几个调用帧
+            error_traceback = traceback.format_exc()
 
         elapsed = round(time.perf_counter() - started, 2)
         verdict = score_case(case, answer, tool_calls)
@@ -396,13 +450,16 @@ def run_agent(
             "tool_outputs": tool_outputs,
             "elapsed_s": elapsed,
             "error": error,
+            "error_traceback": error_traceback,
+            "retries": retries,
             **verdict,
         }
         rows.append(row)
 
         flag = "PASS" if row["passed"] else ("ERR " if error else "FAIL")
         tool_names = [call.get("name", "") for call in tool_calls]
-        print(f"  [{flag}] {row['id']} tools={tool_names} {elapsed}s")
+        retry_note = f" retries={retries}" if retries else ""
+        print(f"  [{flag}] {row['id']} tools={tool_names} {elapsed}s{retry_note}")
         if not row["passed"]:
             print(
                 f"         缺工具={verdict['missing_tools']} "
@@ -414,6 +471,8 @@ def run_agent(
                 print(f"         参数错误：{item}")
             if error:
                 print(f"         错误：{error[:160]}")
+            if error_traceback:
+                print(f"         位置：{short_traceback(error_traceback)}")
     return rows
 
 
@@ -569,6 +628,8 @@ def render_agent_report(rows: list[dict], args, judged: bool) -> str:
     fact_ok = sum(1 for row in rows if row["fact_ok"])
     passed = sum(1 for row in rows if row["passed"])
     errors = sum(1 for row in rows if row.get("error"))
+    retried = sum(1 for row in rows if row.get("retries"))
+    first_try = total - retried
     avg_elapsed = sum(row.get("elapsed_s", 0) for row in rows) / total if total else 0.0
 
     lines = [
@@ -589,6 +650,7 @@ def render_agent_report(rows: list[dict], args, judged: bool) -> str:
         f"| 整体通过率 | {ratio(passed, total)} |",
         f"| 执行报错条数 | {errors} |",
         f"| 平均耗时 | {avg_elapsed:.1f}s |",
+        f"| 一次通过 / 发生重试 | {first_try} / {retried} |",
     ]
 
     if judged:
@@ -621,6 +683,8 @@ def render_agent_report(rows: list[dict], args, judged: bool) -> str:
         else:
             flag = "失败"
         chain = " -> ".join(call["name"] for call in row.get("tool_calls", [])) or "(未调用工具)"
+        if row.get("retries"):
+            flag += f"(重试{row['retries']}次)"
         missing = ", ".join(row["missing_facts"] + row["missing_patterns"]) or "-"
         arg_bad = "; ".join(row.get("call_errors") or []) or "-"
         lines.append(
@@ -648,6 +712,8 @@ def render_agent_report(rows: list[dict], args, judged: bool) -> str:
                 lines.append(f"- 未满足句式：{', '.join(row['missing_patterns'])}")
             if row.get("error"):
                 lines.append(f"- 报错：{row['error'][:200]}")
+                if row.get("error_traceback"):
+                    lines.append(f"- 出错位置：{short_traceback(row['error_traceback'])}")
             excerpt = (row.get("answer") or "").replace("\n", " ")[:160]
             lines.append(f"- 回答节选：{excerpt or '(空)'}")
             lines.append("")
@@ -675,6 +741,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("retrieval", "agent", "judge"), default="retrieval")
     parser.add_argument("--set", dest="case_set", default=None, help="评测集路径，默认按模式选择")
     parser.add_argument("--limit", type=int, default=0, help="只跑前 N 条，0 = 全部")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="只跑指定 id（逗号分隔，如 mh-015 或 mh-002,mh-003）；用于改完判分/工具后单条重放",
+    )
     parser.add_argument("--k", type=int, default=3, help="检索 TopK")
     parser.add_argument("--threshold", type=float, default=CONTAINMENT_THRESHOLD, help="命中判定阈值")
     parser.add_argument("--freeze-date", default=DEFAULT_FREEZE_DATE, help="冻结的当前月份 YYYY-MM，留空用真实时间")
@@ -692,7 +763,9 @@ def main(argv: list[str] | None = None) -> int:
     require_api_key()  # 三种模式都要用 DashScope：embedding 也算调用
 
     if args.mode == "retrieval":
-        rows = run_retrieval(load_jsonl(args.case_set or RETRIEVAL_SET), args.k, args.limit, args.threshold)
+        rows = run_retrieval(
+            load_jsonl(args.case_set or RETRIEVAL_SET), args.k, args.limit, args.threshold, args.only
+        )
         summary = aggregate_retrieval(rows, args.k)
         markdown = render_retrieval_report(rows, summary, args)
         headline = (
@@ -707,6 +780,7 @@ def main(argv: list[str] | None = None) -> int:
             args.freeze_user,
             args.freeze_city,
             args.freeze_date,
+            args.only,
         )
         if args.judge:
             rows = run_judge(rows)

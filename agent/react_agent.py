@@ -2,7 +2,7 @@
 
 基于 ``langchain.agents.create_agent`` 构建扫地机器人智能体：
 - 注册 7 个工具（知识库检索 / 天气 / 用户信息 / 外部业务数据 / 报告上下文）；
-- 挂载 4 个自定义中间件（工具监控、工具参数规范化、模型埋点、动态提示词切换）；
+- 挂载 5 个自定义中间件（工具监控、工具参数规范化、模型埋点、动态提示词切换、模型调用兜底重试）；
 - 对外提供 ``execute``（一次性返回）与 ``execute_stream``（逐段流式返回）两种调用方式。
 """
 from collections.abc import Iterator
@@ -25,6 +25,7 @@ from agent.tools.middleware import (
     monitor_tool,
     normalize_tool_calls,
     report_prompt_switch,
+    retry_model_call,
 )
 from model.factory import get_chat_model
 from utils.logger_handler import logger
@@ -59,6 +60,7 @@ class ReactAgent:
             normalize_tool_calls,
             log_before_model,
             report_prompt_switch,
+            retry_model_call,  # 放最后 = 最贴近模型调用，模型响应解析失败时在这里兜底
         ]
         self.agent = create_agent(
             model=model or get_chat_model(),

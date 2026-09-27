@@ -13,7 +13,7 @@
 | 私有知识库问答 | 本地 PDF / TXT 批量导入，文本分块 → 向量化 → Chroma 入库，TopK 语义检索后由大模型总结回答 |
 | 知识库增量更新 | 基于文件 MD5 判断是否已入库，重复文件自动跳过，避免重复向量化 |
 | ReAct 多工具编排 | 注册 7 个工具，模型自主决定调用顺序（如「取用户ID → 取月份 → 查使用记录 → 检索保养知识」） |
-| 自定义中间件 | 工具调用监控、工具参数规范化、模型调用埋点、动态提示词切换 |
+| 自定义中间件 | 工具调用监控、工具参数规范化、模型调用埋点、动态提示词切换、模型调用兜底重试 |
 | 动态 Prompt 切换 | 识别为报告类需求后自动切换为报告提示词，普通咨询使用系统提示词 |
 | 流式输出 | 以生成器形式逐段返回模型输出，实现打字机效果 |
 | 工程化容错 | 统一日志组件 + 单文件 / 单工具失败不中断整体任务 |
@@ -39,7 +39,7 @@ agent_项目开发/
 │   ├── react_agent.py         # ReAct Agent 封装：工具注册 + 中间件挂载 + 流式输出
 │   └── tools/
 │       ├── agent_tools.py     # 7 个工具：RAG 检索 / 天气 / 用户信息 / 外部 CSV / 报告上下文
-│       └── middleware.py      # 4 个中间件：工具监控 / 参数规范化 / 模型埋点 / 动态提示词切换
+│       └── middleware.py      # 5 个中间件：工具监控 / 参数规范化 / 模型埋点 / 提示词切换 / 模型调用兜底重试
 ├── config/                    # 配置层（YAML 外部配置化）
 │   ├── agent.yml              # 外部数据路径、演示用户池
 │   ├── chroma.yml             # 向量库参数、文本分块参数、知识库源目录
@@ -167,7 +167,7 @@ PromptTemplate(rag_summarize.txt) | ChatTongyi | StrOutputParser
 
 - 工具：`rag_summarize`、`get_weather`、`get_user_id`、`get_user_location`、`get_current_month`、
   `fetch_external_data`、`fill_context_report`
-- 中间件（共 4 个）：
+- 中间件（共 5 个）：
   - `monitor_tool`（`@wrap_tool_call`）：记录工具名 / 入参 / 耗时，**工具异常时返回错误 ToolMessage 而不是抛出**，
     保证单工具失败不中断整体任务；
   - `normalize_tool_calls`（`@wrap_model_call`）：修正历史消息中不合法的 `function.arguments`。
@@ -175,7 +175,10 @@ PromptTemplate(rag_summarize.txt) | ChatTongyi | StrOutputParser
     但把原始字符串回传给 DashScope 会被拒绝并报 `400 ...must be in JSON format`，导致整轮对话中断；
     这里统一以解析后的 args 为准重新序列化，保证回传的历史消息始终是合法 JSON；
   - `log_before_model`（`@before_model`）：记录进入模型前的消息规模与最新消息摘要；
-  - `report_prompt_switch`（`@dynamic_prompt`）：按运行时上下文动态选择系统提示词。
+  - `report_prompt_switch`（`@dynamic_prompt`）：按运行时上下文动态选择系统提示词；
+  - `retry_model_call`（`@wrap_model_call`）：**模型调用兜底重试**。上游适配器（`langchain_community`
+    的 tongyi）拼接流式工具调用增量时偶发缺 `name` 字段，硬取字典键抛 `KeyError`，整轮对话直接被打断；
+    这里捕获这类解析异常并重试一次。它挂在中间件列表**最后一位**，也就是最贴近模型调用的一层。
 - 工具入参容错：`fetch_external_data` 的 `month` 允许省略（默认取当前月份），
   避免模型漏传参数导致整轮报告任务失败。
 
@@ -226,3 +229,135 @@ python tests/test_offline.py
 | PDF 文件解析失败提示缺少依赖 | 执行 `pip install pypdf` |
 | 想更换模型 | 修改 `config/rag.yml` 中的 `chat_model_name` / `embedding_model_name` 后重新构建知识库 |
 | Ctrl+C 中断后无响应 | 已做 KeyboardInterrupt 捕获，终端会提示「已中断，再见！」 |
+
+---
+
+## 九、评测结果
+
+前面的「支持多工具编排」「工程化容错」都是形容词，这一节给的是名词。
+评测集与跑分脚本都在 `evals/`，详见 `evals/README.md`。
+
+### 9.1 评测集
+
+| 集合 | 条数 | 来源 | 测什么 |
+| --- | --- | --- | --- |
+| `evals/golden_retrieval.jsonl` | 50 | 从 `data/` 语料自动派生（30 条语料原句 + 20 条手册改写问句） | 向量检索召回 |
+| `evals/golden_multihop.jsonl` | 15 | 手写 | 工具编排 / 参数补全 / 相对时间 / 负例 / 幻觉抑制 |
+
+环境冻结：用户 `001`、城市 `深圳`、当前月份 `2026-09`。
+（`get_user_id` / `get_user_location` 是随机取值的、`get_current_month` 跟着系统时间走，
+不冻住的话今天的分数明天就不成立。）
+
+### 9.2 检索指标
+
+```bash
+python evals/run_eval.py --mode retrieval      # 只调用 embedding，不调用对话模型
+```
+
+| 指标 | 数值 | 口径 |
+| --- | --- | --- |
+| Recall@3 | **100.0%** (50/50) | 前 3 块里有一块完整包含标准答案 |
+| Hit@1 | **94.0%** | 第 1 块就完整包含标准答案 |
+| MRR | **0.970** | 首次命中的平均倒数排名 |
+
+分层指标（`synthetic` 是用手册标题模板改写出来的问句）：
+
+| 类型 | 条数 | Recall@3 | MRR |
+| --- | --- | --- | --- |
+| corpus_qa（语料原句） | 30 | 100.0% | 0.967 |
+| synthetic（模板改写） | 20 | 100.0% | 0.975 |
+
+### 9.3 一次真实的调参实验
+
+有了固定评测集，改参数才算实验。自变量是 `config/chroma.yml` 里的 `chunk_size`：
+
+| 阶段 | chunk_size / overlap | 向量数 | Recall@3 | Hit@1 | MRR | 未命中 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 起点 | 200 / 20 | 19 | 90.0% | 86.0% | 0.880 | 5 |
+| 修完评测集 | 200 / 20 | 19 | 94.0% | 90.0% | 0.920 | 3 |
+| 调分块 | 400 / 40 | 9 | **100.0%** | **94.0%** | **0.970** | 0 |
+
+失败归因（用 `evals/inspect_chunks.py` 离线复算，不花一分钱）：
+
+- 起点那 5 条里，**2 条是评测集自身的 bug**：生成金标时把故障手册行首的 `- ` 剥掉了，
+  参考答案和语料原文对不上，包含度被卡在 0.57–0.64，看起来像「召回失败」。修好后直接满分。
+  —— **先修评测集，再调参数，否则是在调空气。**
+- 剩下 3 条是分块问题：语料是条目化手册，`chunk_size=200` 把 200–400 字的手册文件切成
+  「主体块 + 尾巴块」，尾巴块只有 51–76 字符，语义弱、被挤出 Top-3。
+  `chunk_size=400` 后三份手册各只剩 1 块，碎片块归零，3 条全部转绿。
+
+### 9.4 端到端指标
+
+```bash
+python evals/run_eval.py --mode agent --limit 3    # 先试水
+python evals/run_eval.py --mode agent              # 15 条多跳用例，跑完整 Agent
+```
+
+| 指标 | 数值 |
+| --- | --- |
+| 工具选择准确率 | **100.0%**（15/15） |
+| 工具参数正确率 | **100.0%**（15/15） |
+| 关键事实命中率 | **100.0%**（15/15） |
+| 端到端通过率 | **100.0%**（15/15） |
+| 执行报错条数 | 0 |
+| 平均单条耗时 | 10.7s |
+
+这个 100% 是修出来的，不是第一版跑出来的。三件事值得记一笔：
+
+- **判分器误伤要先于模型错来排查**：首跑事实命中 80.0% 里有一条，是模型写「滤网已接近寿命上限」、
+  金标要求原文「滤网接近寿命上限」，多插一个字就判没命中。改成 `must_match` 正则 +
+  `must_not_include` 负控两层判据之后，才是模型的真实水平（过程见 `evals/README.md` 实验 4）。
+- **`temperature=0.7` 下 mh-005（幻觉抑制）是概率性通过**：它问的是语料里根本没有的功能，
+  正确行为是拒答。单次绿不等于稳定，要下结论得连跑几次。
+- **mh-015 首跑是崩的**：`KeyError: 'name'` 打断整轮对话（只跑 2.05s、一次工具没调）。
+  当时以为根因在 `monitor_tool` 里那处 `tool_call["name"]` 取值；后来靠完整 traceback 才确认
+  真正的崩点在更下面一层 —— 上游适配器解析流式响应时硬取 `prev_function["name"]`。
+  `monitor_tool` 的防御保留（管「调用序列被截断」），另加第 5 个中间件 `retry_model_call` 做兜底重试。
+
+### 9.5 端到端跑出来的第一个真 bug
+
+首次用 `--limit 3` 试水，三条用例的结果是：
+
+```
+工具选择=100.0%  事实命中=33.3%  通过率=33.3%
+```
+
+工具选择满分、事实几乎全挂 —— 这个组合本身就是线索：**模型知道该调什么工具，但喂给工具的参数不对。**
+加上参数级判分后，两条失败用例的原因直接摊开：
+
+```
+mh-002  期望 {"user_id": "001", "month": "2026-06"}，实际 {"user_id": "001"}
+mh-003  期望 {"user_id": "003", "month": "2026-12"}，实际 {"user_id": "003"}
+```
+
+模型只传了 `user_id`，`month` 全部漏掉。顺着查工具实现，问题在兜底逻辑：
+
+```python
+# 修改前
+if not month:
+    month = get_current_month.func()   # 静默换成当前月
+```
+
+用户问的是「2026-06」，工具却安静地返回了当前月（2026-09）的数据：
+**格式完全正常、数字看着也合理**，只有跟基准数据逐字比对才发现不对。
+这是最坏的一类失败 —— 它不报错，只是把错误伪装成一次成功调用。
+
+修法：
+
+| 改哪 | 改成什么 | 为什么 |
+| --- | --- | --- |
+| `agent/tools/agent_tools.py` | `month` 由可选改为**必填**，缺参时返回带指引的明确提示，不再静默兜底 | 把参数错误暴露在调用点，同时让工具 schema 明确要求模型先想清楚月份 |
+| `evals/golden_multihop.jsonl` | 12 条用例补上 `expected_calls` | 让「参数漏传」可被判分，而不是只在事实维度上表现为掉分 |
+
+> 没有 `expected_calls` 时，这两条失败在报告里长得和「模型总结错了」一模一样，你会跑去调 prompt；
+> 有了它，你直接去修工具。这就是「有评测集」和「只有一个 demo」的分界。
+
+### 9.6 复现
+
+```bash
+python main.py --rebuild-kb                    # 必须用 --rebuild-kb，MD5 增量会让 --build-kb 整批跳过
+python evals/build_golden.py --with-manuals
+python evals/run_eval.py --mode retrieval      # 检索指标（只花 embedding）
+python evals/run_eval.py --mode agent          # 端到端（花对话模型的钱，先 --limit 3 试水）
+python evals/inspect_chunks.py                 # 检索掉分时，先做分块体检
+```

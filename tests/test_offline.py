@@ -8,7 +8,9 @@
 3. 外部 CSV 业务数据解析（含 fetch_external_data 返回纯字符串契约）；
 4. Agent 图构建；
 5. 中间件：工具失败不中断整体任务；
-6. 中间件：工具触发后动态提示词切换生效；\n7. 中间件：修正模型返回的非法 function.arguments（避免回传接口 400）。
+6. 中间件：工具触发后动态提示词切换生效；
+7. 中间件：修正模型返回的非法 function.arguments（避免回传接口 400）；
+8. 中间件：模型响应解析抛 KeyError 时自动重试一次，不打断整轮对话。
 """
 import json
 import os
@@ -23,7 +25,11 @@ from langchain_core.tools import tool  # noqa: E402
 
 from agent.react_agent import ReactAgent  # noqa: E402
 from agent.tools.agent_tools import fetch_external_data  # noqa: E402
-from agent.tools.middleware import _normalize_tool_call_arguments, monitor_tool  # noqa: E402
+from agent.tools.middleware import (  # noqa: E402
+    _normalize_tool_call_arguments,
+    monitor_tool,
+    retry_model_call,
+)
 from utils.config_handler import agent_conf, chroma_conf, rag_conf  # noqa: E402
 from utils.file_handler import get_file_md5, listdir_with_allowed_type  # noqa: E402
 from utils.path_tool import get_abs_path, get_project_root  # noqa: E402
@@ -43,6 +49,24 @@ class OfflineFakeChatModel(GenericFakeChatModel):
             if getattr(message, "type", "") == "system":
                 SEEN_SYSTEM_PROMPTS.append(str(message.content))
                 break
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+# 记录「故意抽风的假模型」被调用了几次（用模块级变量，避免 Agent 内部复制模型实例后读不到）
+FLAKY_MODEL_CALLS: list[int] = []
+
+
+class FlakyFirstCallChatModel(OfflineFakeChatModel):
+    """首次调用抛 KeyError('name')，第二次正常返回。
+
+    复现的是上游 tongyi 适配器 ``subtract_client_response`` 里
+    ``prev_function["name"]`` 硬取字典键、模型偶发不返回 name 时的崩溃现场。
+    """
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
+        FLAKY_MODEL_CALLS.append(1)
+        if len(FLAKY_MODEL_CALLS) == 1:
+            raise KeyError("name")
         return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
@@ -81,7 +105,7 @@ def test_config_and_utils(checker: Checker) -> None:
     checker.check("工程根目录存在", os.path.isdir(get_project_root()))
     checker.check("config/rag.yml 读取成功", rag_conf["chat_model_name"] == "qwen3-max")
     checker.check("config/chroma.yml 读取成功", chroma_conf["collection_name"] == "agent")
-    checker.check("文本分块参数生效", chroma_conf["chunk_size"] == 200 and chroma_conf["chunk_overlap"] == 20)
+    checker.check("文本分块参数生效", chroma_conf["chunk_size"] == 400 and chroma_conf["chunk_overlap"] == 40)
     checker.check("中文分隔符未被破坏", "。" in chroma_conf["separators"])
     checker.check("外部数据路径配置存在", bool(agent_conf["external_data_path"]))
     checker.check("系统提示词非空", len(load_system_prompt()) > 100)
@@ -137,7 +161,7 @@ def test_agent_graph(checker: Checker) -> None:
     agent = ReactAgent(model=model)
     checker.check("Agent 构建成功", agent.agent is not None)
     checker.check("注册工具数量为 7", len(agent.tools) == 7, f"实际 {len(agent.tools)}")
-    checker.check("挂载中间件数量为 4", len(agent.middleware) == 4, f"实际 {len(agent.middleware)}")
+    checker.check("挂载中间件数量为 5", len(agent.middleware) == 5, f"实际 {len(agent.middleware)}")
 
     result = agent.execute("生成我的本月使用报告")
     checker.check("非流式执行返回回答", result == "已生成使用报告", repr(result))
@@ -226,6 +250,29 @@ def test_tool_call_argument_normalization(checker: Checker) -> None:
     checker.check("合法参数不会被改动", _normalize_tool_call_arguments(legal) is None)
 
 
+def test_model_call_retry(checker: Checker) -> None:
+    print("\n[7] 模型调用兜底重试（上游适配器解析畸形响应）")
+    FLAKY_MODEL_CALLS.clear()
+    model = FlakyFirstCallChatModel(messages=iter([AIMessage(content="重试之后拿到了回答")]))
+    agent = create_agent(
+        model=model,
+        tools=[always_fail],
+        middleware=[retry_model_call],
+        system_prompt="测试用系统提示词",
+    )
+
+    try:
+        result = agent.invoke({"messages": [HumanMessage("随便问点东西")]})
+        texts = [str(message.content) for message in result["messages"]]
+        checker.check("模型解析抛 KeyError 未打断整轮对话", True)
+        checker.check("重试后拿到模型回答", "重试之后拿到了回答" in texts)
+        checker.check("确实重试了模型调用", len(FLAKY_MODEL_CALLS) == 2, f"实际调用 {len(FLAKY_MODEL_CALLS)} 次")
+    except Exception as e:  # pragma: no cover
+        checker.check("模型解析抛 KeyError 未打断整轮对话", False, f"抛出异常 {type(e).__name__}: {e}")
+        checker.check("重试后拿到模型回答", False)
+        checker.check("确实重试了模型调用", False)
+
+
 def main() -> int:
     checker = Checker()
     test_config_and_utils(checker)
@@ -234,6 +281,7 @@ def main() -> int:
     test_agent_graph(checker)
     test_tool_failure_tolerance(checker)
     test_tool_call_argument_normalization(checker)
+    test_model_call_retry(checker)
     return checker.report()
 
 

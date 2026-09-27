@@ -1,10 +1,11 @@
 """Agent 中间件模块。
 
-四个自定义中间件分别解决四件事：
+五个自定义中间件分别解决五件事：
 1. ``monitor_tool``            —— 工具调用监控：记录入参 / 耗时 / 结果，失败不中断整体任务；
 2. ``normalize_tool_calls``    —— 模型调用前修正历史消息里不合法的 ``function.arguments``；
 3. ``log_before_model``        —— 模型调用埋点：记录每次进入模型前的上下文规模；
-4. ``report_prompt_switch``    —— 动态提示词切换：报告场景自动切换到报告提示词。
+4. ``report_prompt_switch``    —— 动态提示词切换：报告场景自动切换到报告提示词；
+5. ``retry_model_call``        —— 模型调用兜底重试：上游适配器解析畸形响应抛 KeyError 时重试一次。
 
 其中 ``monitor_tool`` 在检测到 ``fill_context_report`` 被调用后，
 会向运行时上下文写入 ``report=True``，``report_prompt_switch`` 据此切换提示词，
@@ -40,23 +41,6 @@ from utils.prompt_loader import load_report_prompt, load_system_prompt
 REPORT_CONTEXT_FLAG = "report"
 # 触发提示词切换的工具名（需与 agent_tools.py 中注册的工具名保持一致）
 REPORT_SWITCH_TOOL = "fill_context_report"
-import time
-from typing import Callable, Union
-
-from langchain.agents import AgentState
-from langchain.agents.middleware import ModelRequest, before_model, dynamic_prompt, wrap_tool_call
-from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import ToolMessage
-from langgraph.runtime import Runtime
-from langgraph.types import Command
-
-from utils.logger_handler import logger
-from utils.prompt_loader import load_report_prompt, load_system_prompt
-
-# 运行时上下文中「报告场景」的标记位
-REPORT_CONTEXT_FLAG = "report"
-# 触发提示词切换的工具名（需与 agent_tools.py 中注册的工具名保持一致）
-REPORT_SWITCH_TOOL = "fill_context_report"
 
 
 @wrap_tool_call
@@ -65,8 +49,22 @@ def monitor_tool(
     handler: Callable[[ToolCallRequest], Union[ToolMessage, Command]],
 ) -> Union[ToolMessage, Command]:
     """工具调用监控中间件。"""
-    tool_name = request.tool_call["name"]
-    tool_args = request.tool_call.get("args")
+    tool_call = request.tool_call or {}
+    tool_name = tool_call.get("name") or ""
+    tool_args = tool_call.get("args")
+    tool_call_id = tool_call.get("id") or ""
+
+    if not tool_name:
+        # 模型偶发会返回没有 name 的工具调用（流式拼接截断等）。
+        # 直接取 ["name"] 会抛 KeyError 把整轮对话打断，这里降级成一条错误回执，
+        # 让模型自己重发一次合法调用，而不是让整条用例挂掉。
+        logger.error(f"[工具监控]收到缺少 name 的工具调用，已拒绝执行：{tool_call}")
+        return ToolMessage(
+            content="工具调用缺少 name 字段，无法执行。请重新发起一次完整的工具调用。",
+            tool_call_id=tool_call_id,
+            status="error",
+        )
+
     start_time = time.perf_counter()
 
     logger.info(f"[工具监控]开始调用工具：{tool_name}，入参：{tool_args}")
@@ -78,7 +76,7 @@ def monitor_tool(
         logger.error(f"[工具监控]工具 {tool_name} 调用失败：{e}", exc_info=True)
         return ToolMessage(
             content=f"工具 {tool_name} 执行失败：{e}",
-            tool_call_id=request.tool_call["id"],
+            tool_call_id=tool_call_id,
             status="error",
         )
 
@@ -182,6 +180,33 @@ def normalize_tool_calls(request: ModelRequest, handler: Callable) -> Any:
         request = request.override(messages=messages)
 
     return handler(request)
+
+
+@wrap_model_call
+def retry_model_call(request: ModelRequest, handler: Callable) -> Any:
+    """模型调用兜底重试：上游适配器解析畸形响应时重试一次，而不是打断整轮对话。
+
+    实测现场（``evals/results/`` 里 mh-003 的完整 traceback）::
+
+        langchain_community/chat_models/tongyi.py:611  subtract_client_response
+            prev_function["name"], ""            # KeyError: 'name'
+
+    ``ChatTongyi`` 在流式增量拼接工具调用时，假定每个增量块都带 ``name`` 字段；
+    qwen3-max 偶发返回不带 name 的工具调用块，拼接阶段就抛 ``KeyError('name')``。
+    这个异常发生在「模型响应解析」阶段，比工具中间件更早，所以 ``monitor_tool``
+    的防御抓不到它；``max_retries`` 只在 HTTP 层重试，同样救不了它。
+
+    只重试一次、且只针对 ``KeyError``：模型重新生成一次大概率就是正常响应；
+    网络类错误已经有 ``max_retries`` 兜底，不在这里重复打。
+    """
+    try:
+        return handler(request)
+    except KeyError as error:
+        logger.warning(
+            f"[模型调用]本次响应解析失败（{type(error).__name__}: {error}），"
+            f"疑似上游适配器拼接工具调用时缺少 name 字段，重试一次"
+        )
+        return handler(request)
 
 
 @before_model
