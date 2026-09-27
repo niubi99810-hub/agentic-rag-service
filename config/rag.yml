@@ -1,0 +1,11 @@
+# ====================== 对话大模型 / 向量模型配置 ======================
+# 模型名称外部配置化，切换模型只需要改这里，不用改业务代码
+chat_model_name: qwen3-max
+embedding_model_name: text-embedding-v4
+
+# 采样参数（通过 model_kwargs 透传给 DashScope）
+temperature: 0.7
+top_p: 0.8
+
+# 调用失败自动重试次数
+max_retries: 3

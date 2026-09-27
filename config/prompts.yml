@@ -1,0 +1,5 @@
+# ====================== 提示词文件路径配置 ======================
+# 所有提示词独立存放在 txt 文件中，修改 prompt 无需改动业务代码
+main_prompt_path: prompts/main_prompt.txt
+rag_summarize_prompt_path: prompts/rag_summarize.txt
+report_prompts_path: prompts/report_prompt.txt

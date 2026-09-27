@@ -1,0 +1,23 @@
+# LangChain 依赖
+langchain==1.4.0
+langchain-core==1.6.2
+langchain-community==0.4.2
+langchain-classic==1.0.8
+
+# LangGraph（Agent 运行时 / 状态机）
+langgraph==1.2.11
+
+# 向量库与文本分割
+langchain-chroma==1.1.0
+chromadb==1.5.9
+langchain-text-splitters==1.1.2
+
+# 通义千问 / DashScope 模型 SDK
+dashscope==1.27.4
+
+# PDF 文档解析（PyPDFLoader 依赖）
+pypdf>=5.0.0
+
+# 配置与环境变量
+PyYAML==6.0.3
+python-dotenv==1.2.3
