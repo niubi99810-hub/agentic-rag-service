@@ -543,6 +543,7 @@ def retry_model_call(request: ModelRequest, handler: Callable) -> Any:
 | 工具参数正确率 | 100.0% |
 | 关键事实命中率 | 100.0% |
 | 端到端通过率 | 100.0% |
+| 一次通过 / 发生重试 | 15 / 0 |
 
 调参记录：chunk_size 200 → 400 后 Recall@3 从 90.0% 提升到 100.0%。
 
