@@ -169,20 +169,28 @@ def _format_record(record: dict[str, Any]) -> str:
 @tool(
     description=(
         "从外部系统中获取指定用户在指定月份的扫地机器人使用记录，"
-        "入参为 user_id（用户ID）与 month（月份，格式 YYYY-MM，可省略，省略时默认当前月份），"
+        "入参为 user_id（用户ID）与 month（月份，格式 YYYY-MM，两个参数都必填），"
         "结果以纯字符串返回；未检索到时返回空字符串"
     )
 )
-def fetch_external_data(user_id: str, month: str = "") -> str:
+def fetch_external_data(user_id: str, month: str) -> str:
     """读取外部业务系统的用户月度使用记录。
 
-    ``month`` 可省略：省略时默认取当前月份，避免模型漏传参数导致整轮任务失败。
+    ``month`` 是必填参数：不知道月份就先调 ``get_current_month`` 拿到再传进来。
+
+    这里刻意不做「没传月份就用当前月」的兜底。兜底会把调用方的错误伪装成一次成功调用：
+    用户问「上个月」，工具安静地返回本月数据，格式正常、数字看着也合理，
+    错误只会在最终答案里表现成一句错话，排查时根本定位不到调用点。
+    宁可在这里明确拒绝，让 agent 循环拿到提示后自己补参数。
     """
     user_id = str(user_id).strip()
-    month = str(month).strip()
+    month = str(month or "").strip()
     if not month:
-        month = get_current_month.func()
-        logger.warning(f"[fetch_external_data]未传入月份，默认使用当前月份：{month}")
+        logger.warning(f"[fetch_external_data]缺少必填参数 month：user_id={user_id}")
+        return (
+            "缺少必填参数 month。请先用 get_current_month 取得当前月份，"
+            "或按用户原话换算相对时间（如「上个月」），再以 YYYY-MM 格式重新调用本工具。"
+        )
 
     data = _load_external_data()
     record = data.get(user_id, {}).get(month)

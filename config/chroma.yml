@@ -9,8 +9,8 @@ persist_directory: rag/chroma_db
 k: 3
 
 # ====================== 文本分块参数 ======================
-chunk_size: 200
-chunk_overlap: 20
+chunk_size: 400
+chunk_overlap: 40
 separators: ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
 
 # ====================== 知识库源文件配置 ======================
